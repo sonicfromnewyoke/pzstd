@@ -30,6 +30,13 @@ pub const DEFAULT_FRAME_CAPACITY: usize = 512 * 1024 * 1024;
 /// Used to compute per-frame decompression upper bounds when Frame_Content_Size is absent.
 pub const BLOCK_MAX_DECOMPRESSED_SIZE: usize = 128 * 1024;
 
+/// Extra bytes appended to each per-frame output region so that zstd's
+/// internal wildcopy loop (`ZSTD_wildcopy`) can use fast 16/32-byte SIMD
+/// copies without falling back to the bounds-checked slow path for
+/// sequences near the end of the last block.
+/// Matches `WILDCOPY_OVERLENGTH` in zstd's `zstd_internal.h`.
+pub const WILDCOPY_OVERLENGTH: usize = 32;
+
 /// Lookup table: DID_Flag -> Dictionary_ID field size in bytes.
 /// Index by `did_flag` (2 bits, 0..=3).
 pub const DID_FIELD_SIZES: [usize; 4] = [0, 1, 2, 4];
