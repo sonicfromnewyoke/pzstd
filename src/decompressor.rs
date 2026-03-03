@@ -16,6 +16,89 @@ thread_local! {
         RefCell::new(zstd::bulk::Decompressor::new().unwrap());
 }
 
+/// Configuration for parallel decompression.
+///
+/// Use the builder pattern to customize behavior:
+///
+/// ```no_run
+/// let compressed = std::fs::read("snapshot.tar.zst").unwrap();
+/// let data = pzstd::DecompressOptions::new()
+///     .max_frame_size(256 * 1024 * 1024)
+///     .num_threads(8)
+///     .decompress(&compressed)
+///     .unwrap();
+/// ```
+pub struct DecompressOptions {
+    max_frame_size: usize,
+    num_threads: Option<usize>,
+}
+
+impl Default for DecompressOptions {
+    fn default() -> Self {
+        Self {
+            max_frame_size: DEFAULT_FRAME_CAPACITY,
+            num_threads: None,
+        }
+    }
+}
+
+impl DecompressOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the maximum decompressed size per frame (safety limit).
+    /// Only used when `Frame_Content_Size` is not available.
+    pub fn max_frame_size(mut self, size: usize) -> Self {
+        self.max_frame_size = size;
+        self
+    }
+
+    /// Set the number of decompression threads.
+    /// When set, creates a dedicated rayon thread pool instead of
+    /// using the global pool. This prevents contention with other
+    /// rayon users in the process.
+    ///
+    /// When `None` (default), uses the rayon global thread pool.
+    pub fn num_threads(mut self, n: usize) -> Self {
+        self.num_threads = Some(n);
+        self
+    }
+
+    /// Decompress the input with the configured options.
+    pub fn decompress(&self, input: &[u8]) -> Result<Vec<u8>> {
+        let frames = Frame::scan_frames(input, FrameScanMode::DataOnly)?;
+
+        let mut total_decompressed: usize = 0;
+        let all_sizes_known = frames.iter().all(|f| match f.decompressed_size {
+            Some(s) if (s as usize) <= self.max_frame_size => {
+                total_decompressed += s as usize;
+                true
+            }
+            _ => false,
+        });
+
+        let run = || {
+            if all_sizes_known {
+                decompress_fast_path(input, &frames, total_decompressed)
+            } else {
+                decompress_fallback(input, &frames, self.max_frame_size)
+            }
+        };
+
+        match self.num_threads {
+            Some(n) => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .map_err(|e| PzstdError::ThreadPoolError(e.to_string()))?;
+                pool.install(run)
+            }
+            None => run(),
+        }
+    }
+}
+
 /// Decompress a zstd or pzstd compressed input in parallel.
 ///
 /// Scans the input for independent zstd frame boundaries, then
@@ -43,23 +126,9 @@ thread_local! {
 /// - [`PzstdError::DecompressFailed`] if any frame fails to decompress,
 ///   including when decompressed size exceeds `max_frame_size`.
 pub fn decompress_with_max_frame_size(input: &[u8], max_frame_size: usize) -> Result<Vec<u8>> {
-    let frames = Frame::scan_frames(input, FrameScanMode::DataOnly)?;
-
-    // Single pass: check all frames have known sizes within limit and compute total
-    let mut total_decompressed: usize = 0;
-    let all_sizes_known = frames.iter().all(|f| match f.decompressed_size {
-        Some(s) if (s as usize) <= max_frame_size => {
-            total_decompressed += s as usize;
-            true
-        }
-        _ => false,
-    });
-
-    if all_sizes_known {
-        decompress_fast_path(input, &frames, total_decompressed)
-    } else {
-        decompress_fallback(input, &frames, max_frame_size)
-    }
+    DecompressOptions::new()
+        .max_frame_size(max_frame_size)
+        .decompress(input)
 }
 
 /// Fast path: all frames have known decompressed sizes.
@@ -161,12 +230,10 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) ->
         return Ok(unsafe { transmute_uninit_vec(buf) });
     }
 
-    let mut offsets = Vec::with_capacity(frames.len());
-    let mut total_bound: usize = 0;
-    for frame in frames {
-        offsets.push(total_bound);
-        total_bound += frame.decompressed_bound.min(max_frame_size);
-    }
+    let total_bound: usize = frames
+        .iter()
+        .map(|f| f.decompressed_bound.min(max_frame_size))
+        .sum();
 
     let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(total_bound);
     unsafe { buf.set_len(total_bound) };
@@ -177,12 +244,11 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) ->
         .par_iter()
         .enumerate()
         .map(|(idx, frame)| {
-            let region_offset = offsets[idx];
-            let region_size = if idx + 1 < offsets.len() {
-                offsets[idx + 1] - region_offset
-            } else {
-                total_bound - region_offset
-            };
+            let region_offset: usize = frames[..idx]
+                .iter()
+                .map(|f| f.decompressed_bound.min(max_frame_size))
+                .sum();
+            let region_size = frame.decompressed_bound.min(max_frame_size);
 
             // SAFETY: each thread writes to a disjoint region derived from
             // non-overlapping bound-based offsets.
@@ -211,12 +277,13 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) ->
     let total_actual: usize = actual_sizes.iter().sum();
     let ptr = output.as_mut_ptr();
     let mut write_pos: usize = 0;
+    let mut read_pos: usize = 0;
     for (idx, &actual) in actual_sizes.iter().enumerate() {
-        let read_pos = offsets[idx];
         if write_pos != read_pos && actual > 0 {
             unsafe { std::ptr::copy(ptr.add(read_pos), ptr.add(write_pos), actual) };
         }
         write_pos += actual;
+        read_pos += frames[idx].decompressed_bound.min(max_frame_size);
     }
 
     unsafe { buf.set_len(total_actual) };
@@ -241,5 +308,5 @@ fn decompress_fallback(input: &[u8], frames: &[Frame], max_frame_size: usize) ->
 /// # Errors
 /// See [`decompress_with_max_frame_size`] for the full list of error conditions.
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
-    decompress_with_max_frame_size(input, DEFAULT_FRAME_CAPACITY)
+    DecompressOptions::default().decompress(input)
 }

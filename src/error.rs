@@ -29,6 +29,9 @@ pub enum PzstdError {
         frame_index: usize,
         source: std::io::Error,
     },
+
+    #[error("failed to create thread pool: {0}")]
+    ThreadPoolError(String),
 }
 
 pub type Result<T> = core::result::Result<T, PzstdError>;
