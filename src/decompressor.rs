@@ -94,7 +94,7 @@ fn with_decompressor<T>(
 /// Caller must ensure all bytes in `0..len` are written before being read.
 /// Safe to drop without writing (no drop glue for `u8`).
 #[inline]
-unsafe fn alloc_uninit(len: usize) -> Vec<u8> {
+unsafe fn alloc_uninit_vec(len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(len);
     #[allow(clippy::uninit_vec)]
     unsafe {
